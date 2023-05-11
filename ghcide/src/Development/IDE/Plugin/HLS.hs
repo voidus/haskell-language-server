@@ -9,43 +9,44 @@ module Development.IDE.Plugin.HLS
     , Log(..)
     ) where
 
-import           Control.Exception            (SomeException)
-import           Control.Lens                 ((^.))
+import           Control.Exception             (SomeException)
+import           Control.Lens                  ((^.))
 import           Control.Monad
-import qualified Data.Aeson                   as J
-import           Data.Bifunctor               (first)
-import           Data.Dependent.Map           (DMap)
-import qualified Data.Dependent.Map           as DMap
+import qualified Data.Aeson                    as J
+import           Data.Bifunctor                (first)
+import           Data.Dependent.Map            (DMap)
+import qualified Data.Dependent.Map            as DMap
 import           Data.Dependent.Sum
 import           Data.Either
-import qualified Data.List                    as List
-import           Data.List.NonEmpty           (NonEmpty, nonEmpty, toList)
-import qualified Data.List.NonEmpty           as NE
-import qualified Data.Map                     as Map
+import qualified Data.List                     as List
+import           Data.List.NonEmpty            (NonEmpty, nonEmpty, toList)
+import qualified Data.List.NonEmpty            as NE
+import qualified Data.Map                      as Map
 import           Data.Some
 import           Data.String
-import           Data.Text                    (Text)
-import qualified Data.Text                    as T
-import           Development.IDE.Core.Shake   hiding (Log)
+import           Data.Text                     (Text)
+import qualified Data.Text                     as T
+import           Development.IDE.Core.Language (getParamLanguage)
+import           Development.IDE.Core.Shake    hiding (Log)
 import           Development.IDE.Core.Tracing
-import           Development.IDE.Graph        (Rules)
+import           Development.IDE.Graph         (Rules)
 import           Development.IDE.LSP.Server
 import           Development.IDE.Plugin
-import qualified Development.IDE.Plugin       as P
+import qualified Development.IDE.Plugin        as P
 import           Development.IDE.Types.Logger
 import           Ide.Plugin.Config
-import           Ide.PluginUtils              (getClientConfig)
-import           Ide.Types                    as HLS
-import qualified Language.LSP.Server          as LSP
+import           Ide.PluginUtils               (getClientConfig)
+import           Ide.Types                     as HLS
+import qualified Language.LSP.Server           as LSP
 import           Language.LSP.Types
-import qualified Language.LSP.Types           as J
-import qualified Language.LSP.Types.Lens      as LSP
+import qualified Language.LSP.Types            as J
+import qualified Language.LSP.Types.Lens       as LSP
 import           Language.LSP.VFS
-import           Prettyprinter.Render.String  (renderString)
-import           Text.Regex.TDFA.Text         ()
-import           UnliftIO                     (MonadUnliftIO)
-import           UnliftIO.Async               (forConcurrently)
-import           UnliftIO.Exception           (catchAny)
+import           Prettyprinter.Render.String   (renderString)
+import           Text.Regex.TDFA.Text          ()
+import           UnliftIO                      (MonadIO (liftIO), MonadUnliftIO)
+import           UnliftIO.Async                (forConcurrently)
+import           UnliftIO.Exception            (catchAny)
 
 -- ---------------------------------------------------------------------
 --
@@ -214,8 +215,10 @@ extensiblePlugins recorder xs = mempty { P.pluginHandlers = handlers }
       (IdeMethod m :=> IdeHandler fs') <- DMap.assocs handlers'
       pure $ requestHandler m $ \ide params -> do
         config <- Ide.PluginUtils.getClientConfig
+        language <- liftIO $ getParamLanguage ide m params
+
         -- Only run plugins that are allowed to run on this request
-        let fs = filter (\(_, desc, _) -> pluginEnabled m params desc config) fs'
+        let fs = filter (\(_, desc, _) -> pluginEnabled m language params desc config) fs'
         -- Clients generally don't display ResponseErrors so instead we log any that we come across
         case nonEmpty fs of
           Nothing -> do
@@ -252,8 +255,9 @@ extensibleNotificationPlugins recorder xs = mempty { P.pluginHandlers = handlers
       (IdeNotification m :=> IdeNotificationHandler fs') <- DMap.assocs handlers'
       pure $ notificationHandler m $ \ide vfs params -> do
         config <- Ide.PluginUtils.getClientConfig
+        language <- liftIO $ getParamLanguage ide m params
         -- Only run plugins that are allowed to run on this request
-        let fs = filter (\(_, desc, _) -> pluginEnabled m params desc config) fs'
+        let fs = filter (\(_, desc, _) -> pluginEnabled m language params desc config) fs'
         case nonEmpty fs of
           Nothing -> do
             logWith recorder Warning (LogNoPluginForMethod $ Some m)

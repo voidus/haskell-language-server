@@ -9,6 +9,7 @@
 {-# LANGUAGE FlexibleInstances          #-}
 {-# LANGUAGE GADTs                      #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
+{-# LANGUAGE LambdaCase                 #-}
 {-# LANGUAGE MultiParamTypeClasses      #-}
 {-# LANGUAGE NamedFieldPuns             #-}
 {-# LANGUAGE OverloadedStrings          #-}
@@ -25,6 +26,8 @@ module Ide.Types
 , defaultPluginPriority
 , IdeCommand(..)
 , IdeMethod(..)
+, supportedLanguageFromText
+, SupportedLanguage(..)
 , IdeNotification(..)
 , IdePlugins(IdePlugins, ipMap)
 , DynFlagsModifications(..)
@@ -76,6 +79,7 @@ import           Data.Maybe
 import           Data.Ord
 import           Data.Semigroup
 import           Data.String
+import           Data.Text                       (Text)
 import qualified Data.Text                       as T
 import           Data.Text.Encoding              (encodeUtf8)
 import           Development.IDE.Graph
@@ -106,7 +110,6 @@ import           Language.LSP.VFS
 import           Numeric.Natural
 import           OpenTelemetry.Eventlog
 import           Options.Applicative             (ParserInfo)
-import           System.FilePath
 import           System.IO.Unsafe
 import           Text.Regex.TDFA.Text            ()
 
@@ -290,13 +293,13 @@ data PluginDescriptor (ideState :: *) =
 -- | Check whether the given plugin descriptor is responsible for the file with the given path.
 --   Compares the file extension of the file at the given path with the file extension
 --   the plugin is responsible for.
-pluginResponsible :: Uri -> PluginDescriptor c -> Bool
-pluginResponsible uri pluginDesc
-    | Just fp <- mfp
-    , T.pack (takeExtension fp) `elem` pluginFileType pluginDesc = True
-    | otherwise = False
-    where
-      mfp = uriToFilePath uri
+pluginResponsible :: Maybe SupportedLanguage -> PluginDescriptor c -> Bool
+pluginResponsible maybeLanguage pluginDesc =
+    case maybeLanguage of
+        Just language ->
+            supportedLanguageDefaultExtension language `elem` pluginFileType pluginDesc
+        Nothing ->
+            False -- TODO: Maybe fall back to file extension detection?
 
 -- | An existential wrapper of 'Properties'
 data CustomConfig = forall r. CustomConfig (Properties r)
@@ -338,6 +341,22 @@ defaultConfigDescriptor :: ConfigDescriptor
 defaultConfigDescriptor =
     ConfigDescriptor Data.Default.def False (mkCustomConfig emptyProperties)
 
+data SupportedLanguage
+    = Haskell
+    | LiterateHaskell
+    | Cabal
+
+supportedLanguageFromText :: Text -> Maybe SupportedLanguage
+supportedLanguageFromText t = case t of
+    -- "haskell" -> Just Haskell
+    _ -> Nothing
+
+supportedLanguageDefaultExtension :: SupportedLanguage -> Text
+supportedLanguageDefaultExtension = \case
+    Haskell -> ".hs"
+    LiterateHaskell -> ".lhs"
+    Cabal -> ".cabal"
+
 -- | Methods that can be handled by plugins.
 -- 'ExtraParams' captures any extra data the IDE passes to the handlers for this method
 -- Only methods for which we know how to combine responses can be instances of 'PluginMethod'
@@ -368,6 +387,8 @@ class HasTracing (MessageParams m) => PluginMethod (k :: MethodType) (m :: Metho
   pluginEnabled
     :: SMethod m
     -- ^ Method type.
+    -> Maybe SupportedLanguage
+    -- ^ Some plugins only make sense for specific languages
     -> MessageParams m
     -- ^ Whether a plugin is enabled might depend on the message parameters
     --   eg 'pluginFileType' specifies what file extension a plugin is allowed to handle
@@ -381,11 +402,10 @@ class HasTracing (MessageParams m) => PluginMethod (k :: MethodType) (m :: Metho
     -- ^ Is this plugin enabled and allowed to respond to the given request
     -- with the given parameters?
 
-  default pluginEnabled :: (HasTextDocument (MessageParams m) doc, HasUri doc Uri)
-                              => SMethod m -> MessageParams m -> PluginDescriptor c -> Config -> Bool
-  pluginEnabled _ params desc conf = pluginResponsible uri desc && plcGlobalOn (configForPlugin conf desc)
-    where
-        uri = params ^. J.textDocument . J.uri
+  default pluginEnabled :: SMethod m -> Maybe SupportedLanguage -> MessageParams m -> PluginDescriptor c -> Config -> Bool
+  pluginEnabled _ language _params desc conf =
+        pluginResponsible language desc && plcGlobalOn (configForPlugin conf desc)
+
 
 -- ---------------------------------------------------------------------
 -- Plugin Requests
@@ -414,10 +434,8 @@ class PluginMethod Request m => PluginRequestMethod (m :: Method FromClient Requ
   combineResponses _method _config _caps _params = sconcat
 
 instance PluginMethod Request TextDocumentCodeAction where
-  pluginEnabled _ msgParams pluginDesc config =
-    pluginResponsible uri pluginDesc && pluginEnabledConfig plcCodeActionsOn (configForPlugin config pluginDesc)
-    where
-      uri = msgParams ^. J.textDocument . J.uri
+  pluginEnabled _ language _msgParams pluginDesc config =
+    pluginResponsible language pluginDesc && pluginEnabledConfig plcCodeActionsOn (configForPlugin config pluginDesc)
 
 instance PluginRequestMethod TextDocumentCodeAction where
   combineResponses _method _config (ClientCapabilities _ textDocCaps _ _ _) (CodeActionParams _ _ _ _ context) resps =
@@ -447,108 +465,82 @@ instance PluginRequestMethod TextDocumentCodeAction where
         | otherwise = False
 
 instance PluginMethod Request TextDocumentDefinition where
-  pluginEnabled _ msgParams pluginDesc _ =
-    pluginResponsible uri pluginDesc
-    where
-      uri = msgParams ^. J.textDocument . J.uri
+  pluginEnabled _ language _msgParams pluginDesc _ =
+    pluginResponsible language pluginDesc
 
 instance PluginMethod Request TextDocumentTypeDefinition where
-  pluginEnabled _ msgParams pluginDesc _ =
-    pluginResponsible uri pluginDesc
-    where
-      uri = msgParams ^. J.textDocument . J.uri
+  pluginEnabled _ language _msgParams pluginDesc _ =
+    pluginResponsible language pluginDesc
 
 instance PluginMethod Request TextDocumentDocumentHighlight where
-  pluginEnabled _ msgParams pluginDesc _ =
-    pluginResponsible uri pluginDesc
-    where
-      uri = msgParams ^. J.textDocument . J.uri
+  pluginEnabled _ language _msgParams pluginDesc _ =
+    pluginResponsible language pluginDesc
 
 instance PluginMethod Request TextDocumentReferences where
-  pluginEnabled _ msgParams pluginDesc _ =
-    pluginResponsible uri pluginDesc
-    where
-      uri = msgParams ^. J.textDocument . J.uri
+  pluginEnabled _ language _msgParams pluginDesc _ =
+    pluginResponsible language pluginDesc
 
 instance PluginMethod Request WorkspaceSymbol where
   -- Unconditionally enabled, but should it really be?
-  pluginEnabled _ _ _ _ = True
+  pluginEnabled _ _language _ _ _ = True
 
 instance PluginMethod Request TextDocumentCodeLens where
-  pluginEnabled _ msgParams pluginDesc config = pluginResponsible uri pluginDesc
+  pluginEnabled _ language _msgParams pluginDesc config = pluginResponsible language pluginDesc
       && pluginEnabledConfig plcCodeLensOn (configForPlugin config pluginDesc)
-    where
-      uri = msgParams ^. J.textDocument . J.uri
 
 instance PluginMethod Request TextDocumentRename where
-  pluginEnabled _ msgParams pluginDesc config = pluginResponsible uri pluginDesc
+  pluginEnabled _ language _msgParams pluginDesc config = pluginResponsible language pluginDesc
       && pluginEnabledConfig plcRenameOn (configForPlugin config pluginDesc)
-   where
-      uri = msgParams ^. J.textDocument . J.uri
 instance PluginMethod Request TextDocumentHover where
-  pluginEnabled _ msgParams pluginDesc config = pluginResponsible uri pluginDesc
+  pluginEnabled _ language _msgParams pluginDesc config = pluginResponsible language pluginDesc
       && pluginEnabledConfig plcHoverOn (configForPlugin config pluginDesc)
-   where
-      uri = msgParams ^. J.textDocument . J.uri
 
 instance PluginMethod Request TextDocumentDocumentSymbol where
-  pluginEnabled _ msgParams pluginDesc config = pluginResponsible uri pluginDesc
+  pluginEnabled _ language _msgParams pluginDesc config = pluginResponsible language pluginDesc
       && pluginEnabledConfig plcSymbolsOn (configForPlugin config pluginDesc)
-    where
-      uri = msgParams ^. J.textDocument . J.uri
 
 instance PluginMethod Request CompletionItemResolve where
-  pluginEnabled _ msgParams pluginDesc config = pluginEnabledConfig plcCompletionOn (configForPlugin config pluginDesc)
+  pluginEnabled _ _language _msgParams pluginDesc config = pluginEnabledConfig plcCompletionOn (configForPlugin config pluginDesc)
 
 instance PluginMethod Request TextDocumentCompletion where
-  pluginEnabled _ msgParams pluginDesc config = pluginResponsible uri pluginDesc
+  pluginEnabled _ language _msgParams pluginDesc config = pluginResponsible language pluginDesc
       && pluginEnabledConfig plcCompletionOn (configForPlugin config pluginDesc)
-    where
-      uri = msgParams ^. J.textDocument . J.uri
 
 instance PluginMethod Request TextDocumentFormatting where
-  pluginEnabled STextDocumentFormatting msgParams pluginDesc conf =
-    pluginResponsible uri pluginDesc
+  pluginEnabled STextDocumentFormatting language _msgParams pluginDesc conf =
+    pluginResponsible language pluginDesc
       && (PluginId (formattingProvider conf) == pid || PluginId (cabalFormattingProvider conf) == pid)
     where
-      uri = msgParams ^. J.textDocument . J.uri
       pid = pluginId pluginDesc
 
 instance PluginMethod Request TextDocumentRangeFormatting where
-  pluginEnabled _ msgParams pluginDesc conf = pluginResponsible uri pluginDesc
+  pluginEnabled _ language _msgParams pluginDesc conf = pluginResponsible language pluginDesc
       && (PluginId (formattingProvider conf) == pid || PluginId (cabalFormattingProvider conf) == pid)
     where
-      uri = msgParams ^. J.textDocument . J.uri
       pid = pluginId pluginDesc
 
 instance PluginMethod Request TextDocumentPrepareCallHierarchy where
-  pluginEnabled _ msgParams pluginDesc conf = pluginResponsible uri pluginDesc
+  pluginEnabled _ language _msgParams pluginDesc conf = pluginResponsible language pluginDesc
       && pluginEnabledConfig plcCallHierarchyOn (configForPlugin conf pluginDesc)
-    where
-      uri = msgParams ^. J.textDocument . J.uri
 
 instance PluginMethod Request TextDocumentSelectionRange where
-  pluginEnabled _ msgParams pluginDesc conf = pluginResponsible uri pluginDesc
+  pluginEnabled _ language _msgParams pluginDesc conf = pluginResponsible language pluginDesc
       && pluginEnabledConfig plcSelectionRangeOn (configForPlugin conf pluginDesc)
-    where
-      uri = msgParams ^. J.textDocument . J.uri
 
 instance PluginMethod Request TextDocumentFoldingRange where
-  pluginEnabled _ msgParams pluginDesc conf = pluginResponsible uri pluginDesc
+  pluginEnabled _ language _msgParams pluginDesc conf = pluginResponsible language pluginDesc
       && pluginEnabledConfig plcFoldingRangeOn (configForPlugin conf pluginDesc)
-    where
-      uri = msgParams ^. J.textDocument . J.uri
 
 instance PluginMethod Request CallHierarchyIncomingCalls where
   -- This method has no URI parameter, thus no call to 'pluginResponsible'
-  pluginEnabled _ _ pluginDesc conf = pluginEnabledConfig plcCallHierarchyOn (configForPlugin conf pluginDesc)
+  pluginEnabled _ _language _ pluginDesc conf = pluginEnabledConfig plcCallHierarchyOn (configForPlugin conf pluginDesc)
 
 instance PluginMethod Request CallHierarchyOutgoingCalls where
   -- This method has no URI parameter, thus no call to 'pluginResponsible'
-  pluginEnabled _ _ pluginDesc conf = pluginEnabledConfig plcCallHierarchyOn (configForPlugin conf pluginDesc)
+  pluginEnabled _ _language _ pluginDesc conf = pluginEnabledConfig plcCallHierarchyOn (configForPlugin conf pluginDesc)
 
 instance PluginMethod Request CustomMethod where
-  pluginEnabled _ _ _ _ = True
+  pluginEnabled _ _language _ _ _ = True
 
 ---
 instance PluginRequestMethod TextDocumentDefinition where
@@ -667,6 +659,7 @@ class PluginMethod Notification m => PluginNotificationMethod (m :: Method FromC
 
 
 instance PluginMethod Notification TextDocumentDidOpen where
+  pluginEnabled _ language _params desc conf = pluginResponsible language desc && plcGlobalOn (configForPlugin conf desc)
 
 instance PluginMethod Notification TextDocumentDidChange where
 
@@ -676,19 +669,19 @@ instance PluginMethod Notification TextDocumentDidClose where
 
 instance PluginMethod Notification WorkspaceDidChangeWatchedFiles where
   -- This method has no URI parameter, thus no call to 'pluginResponsible'.
-  pluginEnabled _ _ desc conf = plcGlobalOn $ configForPlugin conf desc
+  pluginEnabled _ _language _ desc conf = plcGlobalOn $ configForPlugin conf desc
 
 instance PluginMethod Notification WorkspaceDidChangeWorkspaceFolders where
   -- This method has no URI parameter, thus no call to 'pluginResponsible'.
-  pluginEnabled _ _ desc conf = plcGlobalOn $ configForPlugin conf desc
+  pluginEnabled _ _language _ desc conf = plcGlobalOn $ configForPlugin conf desc
 
 instance PluginMethod Notification WorkspaceDidChangeConfiguration where
   -- This method has no URI parameter, thus no call to 'pluginResponsible'.
-  pluginEnabled _ _ desc conf = plcGlobalOn $ configForPlugin conf desc
+  pluginEnabled _ _language _ desc conf = plcGlobalOn $ configForPlugin conf desc
 
 instance PluginMethod Notification Initialized where
   -- This method has no URI parameter, thus no call to 'pluginResponsible'.
-  pluginEnabled _ _ desc conf = plcGlobalOn $ configForPlugin conf desc
+  pluginEnabled _ _language _ desc conf = plcGlobalOn $ configForPlugin conf desc
 
 
 instance PluginNotificationMethod TextDocumentDidOpen where

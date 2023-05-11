@@ -30,6 +30,7 @@ import           Development.IDE.Core.FileStore        (registerFileWatches,
                                                         setSomethingModified)
 import qualified Development.IDE.Core.FileStore        as FileStore
 import           Development.IDE.Core.IdeConfiguration
+import           Development.IDE.Core.Language         (setFileLanguage)
 import           Development.IDE.Core.OfInterest       hiding (Log, LogShake)
 import           Development.IDE.Core.RuleTypes        (GetClientSettings (..))
 import           Development.IDE.Core.Service          hiding (Log, LogShake)
@@ -57,13 +58,16 @@ whenUriFile uri act = whenJust (LSP.uriToFilePath uri) $ act . toNormalizedFileP
 descriptor :: Recorder (WithPriority Log) -> PluginId -> PluginDescriptor IdeState
 descriptor recorder plId = (defaultPluginDescriptor plId) { pluginNotificationHandlers = mconcat
   [ mkPluginNotificationHandler LSP.STextDocumentDidOpen $
-      \ide vfs _ (DidOpenTextDocumentParams TextDocumentItem{_uri,_version}) -> liftIO $ do
+      \ide vfs _ (DidOpenTextDocumentParams TextDocumentItem{_uri,_version,_languageId}) -> liftIO $ do
       atomically $ updatePositionMapping ide (VersionedTextDocumentIdentifier _uri (Just _version)) (List [])
       whenUriFile _uri $ \file -> do
           -- We don't know if the file actually exists, or if the contents match those on disk
           -- For example, vscode restores previously unsaved contents on open
           addFileOfInterest ide file Modified{firstOpen=True}
           setFileModified (cmapWithPrio LogFileStore recorder) (VFSModified vfs) ide False file
+          case supportedLanguageFromText _languageId of
+            Just language -> setFileLanguage ide file language
+            Nothing -> logWarning (ideLogger ide) $ "Got unknown languageId: " <> _languageId
           logDebug (ideLogger ide) $ "Opened text document: " <> getUri _uri
 
   , mkPluginNotificationHandler LSP.STextDocumentDidChange $
